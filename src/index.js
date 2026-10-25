@@ -7,33 +7,40 @@
 //   POST /webhook
 //   GET  /return
 //
-// Frontend POST /checkout body:
+// CHECKOUT REQUEST BODY:
 // {
 //   "user_id": "SUPABASE_USER_ID",
 //   "plan": "premium"
 // }
 //
-// Required secrets:
+// REQUIRED SECRETS:
 //   SUPABASE_SERVICE_ROLE_KEY
 //   DODO_PAYMENTS_API_KEY
 //   DODO_PAYMENTS_WEBHOOK_KEY
 //
-// Required variables:
+// REQUIRED VARIABLES:
 //   SUPABASE_URL
 //   DODO_PAYMENTS_PRODUCT_ID
 //   DODO_PAYMENTS_ENVIRONMENT
 //   FRONTEND_SETTINGS_URL
 //
-// IMPORTANT:
-// - Never expose server secrets to the frontend.
-// - Never trust user_id without checking the access token.
-// - Never grant credits based on a browser redirect.
+// OPTIONAL SECRET:
+//   CHECKOUT_API_SECRET
+//
+// SECURITY:
+// - No Supabase access token is required.
+// - If CHECKOUT_API_SECRET is configured, requests to
+//   /checkout must include X-Checkout-Secret.
+// - Without CHECKOUT_API_SECRET, /checkout is public.
+// - Never grant credits from the return redirect.
 // ============================================================
 
 const LIVE_API = "https://live.dodopayments.com";
 const TEST_API = "https://test.dodopayments.com";
 
 const ALLOWED_ORIGIN = "https://reportliai.sbs";
+const RETURN_URL =
+  "https://dodo-payments-worker.reportliaihq.workers.dev/return";
 
 // ============================================================
 // MAIN ROUTER
@@ -76,8 +83,10 @@ export default {
       }, 404);
 
     } catch (error) {
-      // Log details in Cloudflare, but do not expose secrets.
-      console.error("Worker error:", error?.stack || error?.message || error);
+      console.error(
+        "Worker error:",
+        error?.stack || error?.message || error
+      );
 
       return json({
         ok: false,
@@ -95,7 +104,8 @@ function corsHeaders() {
   return {
     "Access-Control-Allow-Origin": ALLOWED_ORIGIN,
     "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type, Authorization",
+    "Access-Control-Allow-Headers":
+      "Content-Type, Authorization, X-Checkout-Secret",
     "Access-Control-Max-Age": "86400",
     "Vary": "Origin",
   };
@@ -142,7 +152,13 @@ function validateConfig(env) {
     );
   }
 
-  const settingsUrl = new URL(env.FRONTEND_SETTINGS_URL);
+  let settingsUrl;
+
+  try {
+    settingsUrl = new URL(env.FRONTEND_SETTINGS_URL);
+  } catch {
+    throw new Error("FRONTEND_SETTINGS_URL is not a valid URL");
+  }
 
   if (settingsUrl.protocol !== "https:") {
     throw new Error("FRONTEND_SETTINGS_URL must use HTTPS");
@@ -153,6 +169,35 @@ function dodoBaseUrl(env) {
   return env.DODO_PAYMENTS_ENVIRONMENT === "live_mode"
     ? LIVE_API
     : TEST_API;
+}
+
+// ============================================================
+// OPTIONAL CHECKOUT SECRET
+// ============================================================
+//
+// If CHECKOUT_API_SECRET is configured in Cloudflare,
+// require the matching X-Checkout-Secret header.
+//
+// If it is not configured, checkout is public.
+// A public checkout endpoint is NOT recommended for live mode.
+// ============================================================
+
+function authorizeCheckout(request, env) {
+  if (!env.CHECKOUT_API_SECRET) {
+    console.warn(
+      "WARNING: /checkout is public because CHECKOUT_API_SECRET is not configured."
+    );
+
+    return true;
+  }
+
+  const supplied = request.headers.get("X-Checkout-Secret");
+
+  if (!supplied || supplied !== env.CHECKOUT_API_SECRET) {
+    return false;
+  }
+
+  return true;
 }
 
 // ============================================================
@@ -191,7 +236,7 @@ async function supabaseRequest(env, path, options = {}) {
     });
 
     throw new Error(
-      `Supabase request failed (${response.status}). Check the Worker logs for details.`
+      `Supabase request failed (${response.status}). Check the Worker logs.`
     );
   }
 
@@ -199,77 +244,19 @@ async function supabaseRequest(env, path, options = {}) {
 }
 
 // ============================================================
-// SUPABASE AUTHENTICATION
-// ============================================================
-
-async function authenticate(request, env) {
-  const header = request.headers.get("Authorization");
-
-  if (!header || !header.startsWith("Bearer ")) {
-    return {
-      error: "Missing Supabase access token. Please log in again.",
-      status: 401,
-    };
-  }
-
-  const token = header.slice(7).trim();
-
-  if (!token) {
-    return {
-      error: "Empty access token. Please log in again.",
-      status: 401,
-    };
-  }
-
-  const base = env.SUPABASE_URL.replace(/\/+$/, "");
-
-  const response = await fetch(`${base}/auth/v1/user`, {
-    method: "GET",
-    headers: {
-      "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
-      "Authorization": `Bearer ${token}`,
-    },
-  });
-
-  if (!response.ok) {
-    console.error("Supabase authentication rejected:", response.status);
-
-    return {
-      error: "Your session is invalid or expired. Please log in again.",
-      status: 401,
-    };
-  }
-
-  const user = await response.json();
-
-  if (!user?.id || !user?.email) {
-    return {
-      error: "Supabase did not return a valid authenticated user.",
-      status: 401,
-    };
-  }
-
-  return { user };
-}
-
-// ============================================================
-// CREATE CHECKOUT
+// CREATE CHECKOUT — NO SUPABASE ACCESS TOKEN
 // ============================================================
 
 async function createCheckout(request, env) {
   validateConfig(env);
 
-  // Authenticate the real user first.
-  const auth = await authenticate(request, env);
-
-  if (auth.error) {
+  // Optional shared-secret protection.
+  if (!authorizeCheckout(request, env)) {
     return json({
       ok: false,
-      error: auth.error,
-    }, auth.status);
+      error: "Unauthorized checkout request.",
+    }, 401);
   }
-
-  const user = auth.user;
 
   let body;
 
@@ -282,7 +269,17 @@ async function createCheckout(request, env) {
     }, 400);
   }
 
-  // The frontend request must use this format.
+  if (
+    !body ||
+    typeof body.user_id !== "string" ||
+    !body.user_id.trim()
+  ) {
+    return json({
+      ok: false,
+      error: "Missing user_id in request body.",
+    }, 400);
+  }
+
   if (body.plan !== "premium") {
     return json({
       ok: false,
@@ -290,31 +287,34 @@ async function createCheckout(request, env) {
     }, 400);
   }
 
-  // Compare the frontend ID with the authenticated Supabase ID.
-  if (typeof body.user_id !== "string" || body.user_id !== user.id) {
-    return json({
-      ok: false,
-      error: "The supplied user_id does not match your authenticated account.",
-    }, 403);
-  }
+  const userId = body.user_id.trim();
 
-  // Ensure the app account exists.
+  // Find the user in the application's public.users table.
+  // This verifies that the supplied ID exists, but without
+  // authentication it does NOT prove who sent the request.
   const userRows = await supabaseRequest(
     env,
-    `/rest/v1/users?id=eq.${encodeURIComponent(user.id)}&select=id,email,display_name&limit=1`
+    `/rest/v1/users?id=eq.${encodeURIComponent(userId)}` +
+    `&select=id,email,display_name&limit=1`
   );
 
   if (!Array.isArray(userRows) || userRows.length === 0) {
     return json({
       ok: false,
-      error: "Your Reportli AI account was not found in the users table.",
+      error: "User was not found in the Supabase users table.",
     }, 404);
   }
 
   const appUser = userRows[0];
 
-  // Construct the checkout request.
-  // The product ID and price are controlled by the server.
+  if (!appUser.email) {
+    return json({
+      ok: false,
+      error: "The Supabase user does not have an email address.",
+    }, 400);
+  }
+
+  // Price and product are controlled by Worker configuration.
   const payload = {
     product_cart: [
       {
@@ -324,30 +324,32 @@ async function createCheckout(request, env) {
     ],
 
     customer: {
-      email: user.email,
+      email: appUser.email,
       ...(appUser.display_name
         ? { name: appUser.display_name }
         : {}),
     },
 
     metadata: {
-      user_id: user.id,
+      user_id: appUser.id,
       plan: "premium",
       source: "reportli_ai",
     },
 
-    return_url:
-      "https://dodo-payments-worker.reportliaihq.workers.dev/return",
+    return_url: RETURN_URL,
   };
 
-  const response = await fetch(`${dodoBaseUrl(env)}/checkouts`, {
-    method: "POST",
-    headers: {
-      "Authorization": `Bearer ${env.DODO_PAYMENTS_API_KEY}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(payload),
-  });
+  const response = await fetch(
+    `${dodoBaseUrl(env)}/checkouts`,
+    {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${env.DODO_PAYMENTS_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(payload),
+    }
+  );
 
   const raw = await response.text();
 
@@ -366,33 +368,38 @@ async function createCheckout(request, env) {
       environment: env.DODO_PAYMENTS_ENVIRONMENT,
     });
 
-    // Do not return the raw provider response to the browser.
     return json({
       ok: false,
       error: "Dodo could not create the checkout session.",
       provider_status: response.status,
       hint: response.status === 403
-        ? "Check API key permissions, environment, and account access."
+        ? "Check the API key, permissions, account access, and environment."
         : response.status === 401
           ? "Check the Dodo API key and environment."
-          : "Check the Dodo API request and product configuration.",
+          : "Check the Dodo request format and product configuration.",
     }, 502);
   }
 
-  const checkoutUrl = result.checkout_url || result.checkoutUrl;
+  const checkoutUrl =
+    result.checkout_url ||
+    result.checkoutUrl;
 
-  if (!checkoutUrl) {
+  if (
+    typeof checkoutUrl !== "string" ||
+    !checkoutUrl.startsWith("https://")
+  ) {
     console.error(
-      "Dodo returned no checkout URL:",
+      "Dodo returned no valid checkout URL:",
       JSON.stringify(result).slice(0, 1000)
     );
 
     return json({
       ok: false,
-      error: "Dodo did not return a checkout URL.",
+      error: "Dodo did not return a valid checkout URL.",
     }, 502);
   }
 
+  // Checkout creation is NOT proof of payment.
   // Do not activate subscriptions or grant credits here.
   return json({
     ok: true,
@@ -401,12 +408,13 @@ async function createCheckout(request, env) {
 }
 
 // ============================================================
-// DODO WEBHOOK SIGNATURE VERIFICATION
+// WEBHOOK SIGNATURE VERIFICATION
 // ============================================================
 //
-// This follows Standard Webhooks signature construction.
-// Confirm the exact signing-secret format and headers in your
-// Dodo webhook dashboard before relying on it in production.
+// IMPORTANT:
+// This verifier expects Standard Webhooks-style headers and
+// signing-secret encoding. Verify that this matches the exact
+// secret and signature format provided by your Dodo dashboard.
 // ============================================================
 
 function base64ToBytes(value) {
@@ -453,8 +461,11 @@ async function verifyWebhook(request, rawBody, secret) {
 
   const seconds = Number(timestamp);
 
-  if (!Number.isFinite(seconds)) return false;
+  if (!Number.isFinite(seconds)) {
+    return false;
+  }
 
+  // Reject old signatures to reduce replay risk.
   if (Math.abs(Date.now() / 1000 - seconds) > 300) {
     return false;
   }
@@ -482,7 +493,8 @@ async function verifyWebhook(request, rawBody, secret) {
     ["sign"]
   );
 
-  const signedContent = `${webhookId}.${timestamp}.${rawBody}`;
+  const signedContent =
+    `${webhookId}.${timestamp}.${rawBody}`;
 
   const signature = await crypto.subtle.sign(
     "HMAC",
@@ -490,7 +502,8 @@ async function verifyWebhook(request, rawBody, secret) {
     new TextEncoder().encode(signedContent)
   );
 
-  const expected = bytesToBase64(new Uint8Array(signature));
+  const expected =
+    bytesToBase64(new Uint8Array(signature));
 
   return signatureHeader.split(/\s+/).some((entry) => {
     const [version, value] = entry.split(",");
@@ -541,7 +554,8 @@ async function handleWebhook(request, env) {
 
   console.log("Verified Dodo event:", eventType);
 
-  // A valid but unrelated event can be acknowledged.
+  // Only handle subscription events listed here.
+  // Confirm these names against the events enabled in Dodo.
   const subscriptionEvents = new Set([
     "subscription.created",
     "subscription.active",
@@ -572,7 +586,8 @@ async function handleWebhook(request, env) {
   }
 
   const subscriptionId =
-    data.subscription_id || data.id;
+    data.subscription_id ||
+    data.id;
 
   if (!subscriptionId) {
     return json({
@@ -581,10 +596,10 @@ async function handleWebhook(request, env) {
     }, 500);
   }
 
-  // Ensure the application user exists.
   const users = await supabaseRequest(
     env,
-    `/rest/v1/users?id=eq.${encodeURIComponent(userId)}&select=id&limit=1`
+    `/rest/v1/users?id=eq.${encodeURIComponent(userId)}` +
+    "&select=id&limit=1"
   );
 
   if (!Array.isArray(users) || users.length === 0) {
@@ -624,8 +639,8 @@ async function handleWebhook(request, env) {
     updated_at: new Date().toISOString(),
   };
 
-  // Assumes public.user_subscriptions has a UNIQUE constraint
-  // on user_id and the columns listed above.
+  // Requires public.user_subscriptions to have the listed
+  // columns and a UNIQUE constraint on user_id.
   await supabaseRequest(
     env,
     "/rest/v1/user_subscriptions?on_conflict=user_id",
@@ -638,9 +653,9 @@ async function handleWebhook(request, env) {
     }
   );
 
-  // Credits are intentionally not granted here.
-  // Implement idempotent credit grants after confirming the
-  // exact Dodo event names and your database's credit ledger.
+  // Credits intentionally remain unchanged here.
+  // Add credit grants only after verifying actual Dodo payment
+  // events and implementing an idempotent credit ledger.
 
   return json({
     ok: true,
@@ -654,8 +669,8 @@ async function handleWebhook(request, env) {
 // RETURN HANDLER
 // ============================================================
 //
-// Returning from checkout is not proof of successful payment.
-// Subscription activation is controlled by verified webhooks.
+// A browser redirect is not proof of payment.
+// Verified webhooks control subscription state.
 // ============================================================
 
 function handleReturn(env) {
@@ -664,4 +679,4 @@ function handleReturn(env) {
     "https://reportliai.sbs/settings";
 
   return Response.redirect(destination, 303);
-    }
+      }
