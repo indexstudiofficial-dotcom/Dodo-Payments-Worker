@@ -1,51 +1,33 @@
 // ============================================================
 // REPORTLI AI — DODO PAYMENTS WORKER
 // ============================================================
-// Routes:
-//   GET  /health
-//   POST /checkout
-//   POST /webhook
-//   GET  /return
 //
-// EXISTING DATABASE TABLES:
-//   public.users
-//   public.user_subscriptions
+// ROUTES:
+// GET  /health
+// POST /checkout
+// POST /webhook
+// GET  /return
 //
-// CREDIT RULES:
-//   1. Trial start:
-//      Set balance to 20 only if balance is 0 or NULL.
-//      Never overwrite a positive existing balance.
-//
-//   2. First successful payment after trial:
-//      No additional credits.
-//
-//   3. Subsequent monthly renewal:
-//      Reset balance to exactly 20.
-//
-//   4. Failed/cancelled/expired/on-hold:
-//      No credits.
-//
-//   5. Duplicate renewal:
-//      Compare current_period_end with the stored period.
-//
-// IMPORTANT:
-// No SQL changes or new tables are required.
-// Renewal deduplication is best-effort because the existing
-// schema has no dedicated webhook-event ledger.
+// SUPABASE TABLES:
+// public.users
+// public.user_subscriptions
 //
 // REQUIRED SECRETS:
-//   SUPABASE_SERVICE_ROLE_KEY
-//   DODO_PAYMENTS_API_KEY
-//   DODO_PAYMENTS_WEBHOOK_KEY
+// SUPABASE_SERVICE_ROLE_KEY
+// DODO_PAYMENTS_API_KEY
+// DODO_PAYMENTS_WEBHOOK_KEY
 //
 // REQUIRED VARIABLES:
-//   SUPABASE_URL
-//   DODO_PAYMENTS_PRODUCT_ID
-//   DODO_PAYMENTS_ENVIRONMENT
-//   FRONTEND_SETTINGS_URL
+// SUPABASE_URL
+// DODO_PRODUCT_ID_MONTHLY
+// DODO_PRODUCT_ID_YEARLY
+// DODO_PRODUCT_ID_ONE_TIME
+// DODO_PAYMENTS_ENVIRONMENT
+// FRONTEND_SETTINGS_URL
 //
 // OPTIONAL SECRET:
-//   CHECKOUT_API_SECRET
+// CHECKOUT_API_SECRET
+//
 // ============================================================
 
 const LIVE_API = "https://live.dodopayments.com";
@@ -58,6 +40,32 @@ const RETURN_URL =
 
 const TRIAL_CREDITS = 20;
 const RENEWAL_CREDITS = 20;
+
+// ============================================================
+// PRODUCT CONFIGURATION
+// ============================================================
+
+function getProductConfig(env) {
+  return {
+    monthly: {
+      product_id: env.DODO_PRODUCT_ID_MONTHLY,
+      plan_name: "Premium",
+      billing_period: "monthly",
+    },
+
+    yearly: {
+      product_id: env.DODO_PRODUCT_ID_YEARLY,
+      plan_name: "Premium",
+      billing_period: "yearly",
+    },
+
+    one_time: {
+      product_id: env.DODO_PRODUCT_ID_ONE_TIME,
+      plan_name: "Premium",
+      billing_period: "one_time",
+    },
+  };
+}
 
 // ============================================================
 // ROUTER
@@ -119,7 +127,7 @@ export default {
 
       return json({
         ok: false,
-        error: error?.message || "Unknown internal error",
+        error: error?.message || "Internal server error",
       }, 500);
     }
   },
@@ -152,7 +160,7 @@ function json(data, status = 200) {
 }
 
 // ============================================================
-// CONFIGURATION
+// CONFIGURATION VALIDATION
 // ============================================================
 
 function validateConfig(env) {
@@ -161,7 +169,9 @@ function validateConfig(env) {
     "SUPABASE_SERVICE_ROLE_KEY",
     "DODO_PAYMENTS_API_KEY",
     "DODO_PAYMENTS_WEBHOOK_KEY",
-    "DODO_PAYMENTS_PRODUCT_ID",
+    "DODO_PRODUCT_ID_MONTHLY",
+    "DODO_PRODUCT_ID_YEARLY",
+    "DODO_PRODUCT_ID_ONE_TIME",
     "DODO_PAYMENTS_ENVIRONMENT",
     "FRONTEND_SETTINGS_URL",
   ];
@@ -175,27 +185,33 @@ function validateConfig(env) {
   }
 
   if (
-    env.DODO_PAYMENTS_ENVIRONMENT !== "live_mode" &&
-    env.DODO_PAYMENTS_ENVIRONMENT !== "test_mode"
+    !["live_mode", "test_mode"].includes(
+      env.DODO_PAYMENTS_ENVIRONMENT
+    )
   ) {
     throw new Error(
       "DODO_PAYMENTS_ENVIRONMENT must be live_mode or test_mode"
     );
   }
 
-  let settingsUrl;
-
-  try {
-    settingsUrl = new URL(env.FRONTEND_SETTINGS_URL);
-  } catch {
-    throw new Error(
-      "FRONTEND_SETTINGS_URL is not a valid URL"
-    );
-  }
+  const settingsUrl = new URL(
+    env.FRONTEND_SETTINGS_URL
+  );
 
   if (settingsUrl.protocol !== "https:") {
     throw new Error(
       "FRONTEND_SETTINGS_URL must use HTTPS"
+    );
+  }
+
+  const products = getProductConfig(env);
+  const ids = Object.values(products).map(
+    product => product.product_id
+  );
+
+  if (new Set(ids).size !== 3) {
+    throw new Error(
+      "The three Dodo product IDs must be different."
     );
   }
 }
@@ -207,13 +223,13 @@ function dodoBaseUrl(env) {
 }
 
 // ============================================================
-// OPTIONAL CHECKOUT AUTHORIZATION
+// CHECKOUT AUTHORIZATION
 // ============================================================
 
 function authorizeCheckout(request, env) {
   if (!env.CHECKOUT_API_SECRET) {
     console.warn(
-      "WARNING: /checkout is public because CHECKOUT_API_SECRET is not configured."
+      "WARNING: Checkout endpoint has no shared-secret protection."
     );
 
     return true;
@@ -229,7 +245,7 @@ function authorizeCheckout(request, env) {
 }
 
 // ============================================================
-// SUPABASE REST HELPER
+// SUPABASE REQUEST
 // ============================================================
 
 async function supabaseRequest(
@@ -237,16 +253,15 @@ async function supabaseRequest(
   path,
   options = {}
 ) {
-  const base =
-    env.SUPABASE_URL.replace(/\/+$/, "");
+  const base = env.SUPABASE_URL.replace(/\/+$/, "");
 
   const response = await fetch(
     `${base}${path}`,
     {
       ...options,
       headers: {
-        "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
-        "Authorization":
+        apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+        Authorization:
           `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
         "Content-Type": "application/json",
         ...(options.headers || {}),
@@ -273,7 +288,7 @@ async function supabaseRequest(
     });
 
     throw new Error(
-      `Supabase request failed (${response.status}). Check Worker logs.`
+      `Supabase request failed (${response.status}).`
     );
   }
 
@@ -301,7 +316,7 @@ async function createCheckout(request, env) {
   } catch {
     return json({
       ok: false,
-      error: "Request body must contain valid JSON.",
+      error: "Invalid JSON request.",
     }, 400);
   }
 
@@ -312,63 +327,68 @@ async function createCheckout(request, env) {
   ) {
     return json({
       ok: false,
-      error: "Missing user_id in request body.",
+      error: "Missing user_id.",
     }, 400);
   }
 
-  if (body.plan !== "premium") {
+  const requestedPlan = body.plan;
+
+  const products = getProductConfig(env);
+
+  const selectedProduct = products[requestedPlan];
+
+  if (!selectedProduct) {
     return json({
       ok: false,
-      error: "Unsupported plan. Expected plan: premium.",
+      error: "Invalid plan. Use monthly, yearly or one_time.",
     }, 400);
   }
 
   const userId = body.user_id.trim();
 
-  const userRows = await supabaseRequest(
+  const users = await supabaseRequest(
     env,
     "/rest/v1/users" +
     `?id=eq.${encodeURIComponent(userId)}` +
     "&select=id,email,display_name,balance&limit=1"
   );
 
-  if (
-    !Array.isArray(userRows) ||
-    userRows.length === 0
-  ) {
+  if (!Array.isArray(users) || users.length === 0) {
     return json({
       ok: false,
-      error: "User was not found in Supabase.",
+      error: "User not found.",
     }, 404);
   }
 
-  const appUser = userRows[0];
+  const user = users[0];
 
-  if (!appUser.email) {
+  if (!user.email) {
     return json({
       ok: false,
-      error: "The Supabase user does not have an email address.",
+      error: "User email is missing.",
     }, 400);
   }
 
   const payload = {
     product_cart: [
       {
-        product_id: env.DODO_PAYMENTS_PRODUCT_ID,
+        product_id: selectedProduct.product_id,
         quantity: 1,
       },
     ],
 
     customer: {
-      email: appUser.email,
-      ...(appUser.display_name
-        ? { name: appUser.display_name }
+      email: user.email,
+
+      ...(user.display_name
+        ? { name: user.display_name }
         : {}),
     },
 
     metadata: {
-      user_id: appUser.id,
-      plan: "premium",
+      user_id: user.id,
+      plan_name: selectedProduct.plan_name,
+      billing_period: selectedProduct.billing_period,
       source: "reportli_ai",
     },
 
@@ -379,11 +399,13 @@ async function createCheckout(request, env) {
     `${dodoBaseUrl(env)}/checkouts`,
     {
       method: "POST",
+
       headers: {
-        "Authorization":
+        Authorization:
           `Bearer ${env.DODO_PAYMENTS_API_KEY}`,
         "Content-Type": "application/json",
       },
+
       body: JSON.stringify(payload),
     }
   );
@@ -402,18 +424,12 @@ async function createCheckout(request, env) {
     console.error("Dodo checkout error:", {
       status: response.status,
       response: JSON.stringify(result).slice(0, 1000),
-      environment: env.DODO_PAYMENTS_ENVIRONMENT,
     });
 
     return json({
       ok: false,
-      error: "Dodo could not create the checkout session.",
+      error: "Dodo could not create checkout.",
       provider_status: response.status,
-      hint: response.status === 401
-        ? "Check the Dodo API key and environment."
-        : response.status === 403
-          ? "Check the API key permissions and account access."
-          : "Check the Dodo request and product configuration.",
     }, 502);
   }
 
@@ -425,20 +441,17 @@ async function createCheckout(request, env) {
     typeof checkoutUrl !== "string" ||
     !checkoutUrl.startsWith("https://")
   ) {
-    console.error(
-      "Dodo returned no valid checkout URL:",
-      JSON.stringify(result).slice(0, 1000)
-    );
-
     return json({
       ok: false,
-      error: "Dodo did not return a valid checkout URL.",
+      error: "Invalid checkout URL returned by Dodo.",
     }, 502);
   }
 
   return json({
     ok: true,
     checkout_url: checkoutUrl,
+    plan_name: selectedProduct.plan_name,
+    billing_period: selectedProduct.billing_period,
   });
 }
 
@@ -475,8 +488,7 @@ function constantTimeEqual(a, b) {
   let mismatch = 0;
 
   for (let i = 0; i < a.length; i++) {
-    mismatch |=
-      a.charCodeAt(i) ^ b.charCodeAt(i);
+    mismatch |= a.charCodeAt(i) ^ b.charCodeAt(i);
   }
 
   return mismatch === 0;
@@ -506,11 +518,8 @@ async function verifyWebhook(
 
   const seconds = Number(timestamp);
 
-  if (!Number.isFinite(seconds)) {
-    return false;
-  }
-
   if (
+    !Number.isFinite(seconds) ||
     Math.abs(Date.now() / 1000 - seconds) > 300
   ) {
     return false;
@@ -552,40 +561,114 @@ async function verifyWebhook(
     new Uint8Array(signature)
   );
 
-  return signatureHeader
-    .split(/\s+/)
-    .some((entry) => {
-      const [version, value] = entry.split(",");
+  return signatureHeader.split(/\s+/).some(entry => {
+    const [version, value] = entry.split(",");
 
-      return (
-        version === "v1" &&
-        value &&
-        constantTimeEqual(value, expected)
-      );
-    });
+    return (
+      version === "v1" &&
+      value &&
+      constantTimeEqual(value, expected)
+    );
+  });
+}
+
+// ============================================================
+// PRODUCT IDENTIFICATION
+// ============================================================
+
+function findProductId(data) {
+  if (!data || typeof data !== "object") {
+    return null;
+  }
+
+  if (data.product_id) {
+    return data.product_id;
+  }
+
+  if (data.product?.product_id) {
+    return data.product.product_id;
+  }
+
+  if (data.product?.id) {
+    return data.product.id;
+  }
+
+  if (Array.isArray(data.product_cart)) {
+    const item = data.product_cart[0];
+
+    if (item?.product_id) {
+      return item.product_id;
+    }
+  }
+
+  if (Array.isArray(data.items)) {
+    const item = data.items[0];
+
+    if (item?.product_id) {
+      return item.product_id;
+    }
+  }
+
+  if (data.payment) {
+    return findProductId(data.payment);
+  }
+
+  if (data.checkout_session) {
+    return findProductId(data.checkout_session);
+  }
+
+  return null;
+}
+
+function identifyPlan(data, env) {
+  const products = getProductConfig(env);
+
+  const productId = findProductId(data);
+
+  if (productId) {
+    for (const [key, product] of Object.entries(products)) {
+      if (product.product_id === productId) {
+        return {
+          ...product,
+          product_id: productId,
+          plan_key: key,
+        };
+      }
+    }
+  }
+
+  // Fallback to metadata created by our checkout endpoint.
+  const metadata =
+    data.metadata ||
+    data.payment?.metadata ||
+    data.checkout_session?.metadata ||
+    {};
+
+  const billingPeriod = metadata.billing_period;
+
+  if (billingPeriod && products[billingPeriod]) {
+    return {
+      ...products[billingPeriod],
+      plan_key: billingPeriod,
+    };
+  }
+
+  return null;
 }
 
 // ============================================================
 // USER LOOKUP
 // ============================================================
-//
-// Prefer metadata.user_id.
-// If absent, fall back to the customer's email.
-//
-// Email fallback is provided for compatibility with webhook
-// payloads where subscription metadata is missing.
-// ============================================================
 
-async function findUserForWebhook(
-  env,
-  data
-) {
-  const metadata = data.metadata || {};
+async function findUserForWebhook(env, data) {
+  const metadata =
+    data.metadata ||
+    data.payment?.metadata ||
+    data.checkout_session?.metadata ||
+    {};
 
-  let userId =
+  const userId =
     metadata.user_id ||
-    data.checkout_session?.metadata?.user_id ||
-    data.payment?.metadata?.user_id ||
     null;
 
   if (userId) {
@@ -599,15 +682,12 @@ async function findUserForWebhook(
     if (Array.isArray(rows) && rows.length > 0) {
       return rows[0];
     }
-
-    console.warn(
-      "Metadata user_id did not match a user. Trying customer email."
-    );
   }
 
   const email =
     data.customer?.email ||
     data.customer_email ||
+    data.payment?.customer?.email ||
     null;
 
   if (!email) {
@@ -621,28 +701,23 @@ async function findUserForWebhook(
     "&select=id,email,balance&limit=1"
   );
 
-  if (!Array.isArray(rows) || rows.length === 0) {
-    return null;
-  }
-
-  return rows[0];
+  return Array.isArray(rows) && rows.length > 0
+    ? rows[0]
+    : null;
 }
 
 // ============================================================
 // EXISTING SUBSCRIPTION LOOKUP
 // ============================================================
 
-async function getExistingSubscription(
-  env,
-  userId
-) {
+async function getExistingSubscription(env, userId) {
   const rows = await supabaseRequest(
     env,
     "/rest/v1/user_subscriptions" +
     `?user_id=eq.${encodeURIComponent(userId)}` +
     "&select=id,user_id,dodo_customer_id," +
     "dodo_subscription_id,subscription_status," +
-    "current_period_end,created_at,updated_at&limit=1"
+    "current_period_end,plan_name,billing_period&limit=1"
   );
 
   return Array.isArray(rows) && rows.length > 0
@@ -651,30 +726,13 @@ async function getExistingSubscription(
 }
 
 // ============================================================
-// CREDIT HELPERS
+// TRIAL CREDITS
 // ============================================================
 
-// Trial rule:
-// - Only set the balance to 20 when the existing balance is
-//   zero or NULL.
-// - Preserve positive balances.
-//
-// The conditional PATCH prevents overwriting a positive
-// balance that was observed before this request.
-
-async function grantTrialCredits(
-  env,
-  user
-) {
+async function grantTrialCredits(env, user) {
   const current = Number(user.balance || 0);
 
   if (current > 0) {
-    console.log("Trial credits not granted:", {
-      user_id: user.id,
-      reason: "Existing positive balance preserved",
-      balance: current,
-    });
-
     return {
       granted: false,
       reason: "existing_balance_preserved",
@@ -682,88 +740,51 @@ async function grantTrialCredits(
     };
   }
 
-  // Update only if the balance is still zero.
-  const zeroRows = await supabaseRequest(
-    env,
+  const paths = [
     "/rest/v1/users" +
     `?id=eq.${encodeURIComponent(user.id)}` +
-    "&balance=eq.0" +
-    "&select=id,balance",
-    {
-      method: "PATCH",
-      headers: {
-        "Prefer": "return=representation",
-      },
-      body: JSON.stringify({
-        balance: TRIAL_CREDITS,
-      }),
-    }
-  );
+    "&balance=eq.0",
 
-  if (
-    Array.isArray(zeroRows) &&
-    zeroRows.length > 0
-  ) {
-    console.log("Trial credits granted:", {
-      user_id: user.id,
-      credits: TRIAL_CREDITS,
-    });
-
-    return {
-      granted: true,
-      reason: "trial_balance_initialized",
-      balance: Number(zeroRows[0].balance),
-    };
-  }
-
-  // NULL balance requires a separate conditional update.
-  const nullRows = await supabaseRequest(
-    env,
     "/rest/v1/users" +
     `?id=eq.${encodeURIComponent(user.id)}` +
-    "&balance=is.null" +
-    "&select=id,balance",
-    {
-      method: "PATCH",
-      headers: {
-        "Prefer": "return=representation",
-      },
-      body: JSON.stringify({
-        balance: TRIAL_CREDITS,
-      }),
+    "&balance=is.null",
+  ];
+
+  for (const path of paths) {
+    const rows = await supabaseRequest(
+      env,
+      path + "&select=id,balance",
+      {
+        method: "PATCH",
+        headers: {
+          Prefer: "return=representation",
+        },
+        body: JSON.stringify({
+          balance: TRIAL_CREDITS,
+        }),
+      }
+    );
+
+    if (Array.isArray(rows) && rows.length > 0) {
+      return {
+        granted: true,
+        reason: "trial_balance_initialized",
+        balance: Number(rows[0].balance),
+      };
     }
-  );
-
-  if (
-    Array.isArray(nullRows) &&
-    nullRows.length > 0
-  ) {
-    console.log("Trial credits granted:", {
-      user_id: user.id,
-      credits: TRIAL_CREDITS,
-    });
-
-    return {
-      granted: true,
-      reason: "trial_balance_initialized",
-      balance: Number(nullRows[0].balance),
-    };
   }
 
-  // Balance changed between lookup and update.
   return {
     granted: false,
     reason: "balance_changed_or_already_initialized",
   };
 }
 
-// Renewal rule:
-// Set balance to 20, NOT current balance + 20.
+// ============================================================
+// RENEWAL CREDITS
+// ============================================================
 
-async function resetRenewalCredits(
-  env,
-  userId
-) {
+async function resetRenewalCredits(env, userId) {
   const rows = await supabaseRequest(
     env,
     "/rest/v1/users" +
@@ -772,7 +793,7 @@ async function resetRenewalCredits(
     {
       method: "PATCH",
       headers: {
-        "Prefer": "return=representation",
+        Prefer: "return=representation",
       },
       body: JSON.stringify({
         balance: RENEWAL_CREDITS,
@@ -782,20 +803,37 @@ async function resetRenewalCredits(
 
   if (!Array.isArray(rows) || rows.length === 0) {
     throw new Error(
-      "Could not reset renewal credits: user was not updated."
+      "Could not reset renewal credits."
     );
   }
-
-  console.log("Renewal credits reset:", {
-    user_id: userId,
-    balance: Number(rows[0].balance),
-  });
 
   return Number(rows[0].balance);
 }
 
 // ============================================================
-// HANDLE DODO WEBHOOK
+// SAVE SUBSCRIPTION
+// ============================================================
+
+async function saveSubscription(
+  env,
+  subscription
+) {
+  await supabaseRequest(
+    env,
+    "/rest/v1/user_subscriptions?on_conflict=user_id",
+    {
+      method: "POST",
+      headers: {
+        Prefer:
+          "resolution=merge-duplicates,return=minimal",
+      },
+      body: JSON.stringify(subscription),
+    }
+  );
+}
+
+// ============================================================
+// HANDLE WEBHOOK
 // ============================================================
 
 async function handleWebhook(request, env) {
@@ -836,7 +874,60 @@ async function handleWebhook(request, env) {
   });
 
   // ----------------------------------------------------------
-  // Subscription event allowlist
+  // ONE-TIME PAYMENT
+  // ----------------------------------------------------------
+
+  if (eventType === "payment.succeeded") {
+    const plan = identifyPlan(data, env);
+
+    if (!plan || plan.plan_key !== "one_time") {
+      return json({
+        ok: true,
+        ignored: true,
+        reason: "Not a recognized one-time product.",
+      });
+    }
+
+    const user = await findUserForWebhook(env, data);
+
+    if (!user) {
+      throw new Error(
+        "Could not identify user for one-time payment."
+      );
+    }
+
+    const customerId =
+      data.customer?.customer_id ||
+      data.customer_id ||
+      null;
+
+    await saveSubscription(env, {
+      user_id: user.id,
+      dodo_customer_id: customerId,
+      dodo_subscription_id: null,
+      subscription_status: "active",
+      plan_name: plan.plan_name,
+      billing_period: plan.billing_period,
+      current_period_end: null,
+      updated_at: new Date().toISOString(),
+    });
+
+    console.log("One-time payment saved:", {
+      user_id: user.id,
+      plan_name: plan.plan_name,
+      billing_period: plan.billing_period,
+    });
+
+    return json({
+      ok: true,
+      received: true,
+      plan_name: plan.plan_name,
+      billing_period: plan.billing_period,
+    });
+  }
+
+  // ----------------------------------------------------------
+  // SUBSCRIPTION EVENTS
   // ----------------------------------------------------------
 
   const subscriptionEvents = new Set([
@@ -860,23 +951,23 @@ async function handleWebhook(request, env) {
     });
   }
 
+  const plan = identifyPlan(data, env);
+
+  if (
+    !plan ||
+    !["monthly", "yearly"].includes(plan.plan_key)
+  ) {
+    throw new Error(
+      "Could not identify monthly or yearly product from webhook."
+    );
+  }
+
   const user = await findUserForWebhook(env, data);
 
   if (!user) {
-    console.error(
-      "Cannot map subscription event to a Reportli user.",
-      {
-        event_type: eventType,
-        subscription_id:
-          data.subscription_id || data.id || null,
-      }
+    throw new Error(
+      "Could not identify Reportli user."
     );
-
-    return json({
-      ok: false,
-      error:
-        "Could not identify the Reportli user. Check subscription metadata and customer email.",
-    }, 500);
   }
 
   const subscriptionId =
@@ -885,14 +976,13 @@ async function handleWebhook(request, env) {
     null;
 
   if (!subscriptionId) {
-    return json({
-      ok: false,
-      error: "Missing subscription ID in webhook.",
-    }, 500);
+    throw new Error(
+      "Missing subscription ID."
+    );
   }
 
   // ----------------------------------------------------------
-  // Determine subscription status
+  // STATUS
   // ----------------------------------------------------------
 
   const statusMap = {
@@ -918,9 +1008,9 @@ async function handleWebhook(request, env) {
     data.current_period_end ||
     null;
 
-  // ----------------------------------------------------------
-  // Read existing subscription before updating it.
-  // ----------------------------------------------------------
+  const newPeriodEnd = periodEnd
+    ? new Date(periodEnd).toISOString()
+    : null;
 
   const existing = await getExistingSubscription(
     env,
@@ -930,24 +1020,8 @@ async function handleWebhook(request, env) {
   const previousPeriodEnd =
     existing?.current_period_end || null;
 
-  const newPeriodEnd = periodEnd
-    ? new Date(periodEnd).toISOString()
-    : null;
-
   // ----------------------------------------------------------
-  // TRIAL CREDIT RULE
-  // ----------------------------------------------------------
-  //
-  // Trial detection uses trial_period_days supplied in the
-  // subscription payload.
-  //
-  // This only initializes the balance when it is zero/NULL.
-  // Existing positive balances are preserved.
-  //
-  // IMPORTANT:
-  // If Dodo does not include trial_period_days in a particular
-  // event, this event cannot be reliably identified as trial
-  // activation by this check alone.
+  // TRIAL CREDITS
   // ----------------------------------------------------------
 
   let creditResult = {
@@ -960,7 +1034,10 @@ async function handleWebhook(request, env) {
   );
 
   const isTrialActivation =
-    trialDays > 0 &&
+    (
+      trialDays > 0 ||
+      data.status === "trialing"
+    ) &&
     (
       eventType === "subscription.created" ||
       eventType === "subscription.active"
@@ -974,16 +1051,7 @@ async function handleWebhook(request, env) {
   }
 
   // ----------------------------------------------------------
-  // RENEWAL CREDIT RULE
-  // ----------------------------------------------------------
-  //
-  // Only subscription.renewed can grant renewal credits here.
-  //
-  // subscription_period_count must be greater than 1 to avoid
-  // treating the initial subscription period as a renewal.
-  //
-  // current_period_end is used as a best-effort duplicate
-  // marker using your existing schema.
+  // SUBSEQUENT RENEWAL CREDITS
   // ----------------------------------------------------------
 
   const periodCount = Number(
@@ -996,28 +1064,16 @@ async function handleWebhook(request, env) {
 
   if (isSubsequentRenewal) {
     if (!newPeriodEnd) {
-      console.error(
-        "Renewal event has no billing-period end date."
+      throw new Error(
+        "Renewal missing billing-period end date."
       );
-
-      return json({
-        ok: false,
-        error:
-          "Cannot safely process renewal without next_billing_date or current_period_end.",
-      }, 500);
     }
 
-    if (
-      previousPeriodEnd &&
-      newPeriodEnd ===
-        new Date(previousPeriodEnd).toISOString()
-    ) {
-      console.log("Duplicate renewal period ignored:", {
-        user_id: user.id,
-        subscription_id: subscriptionId,
-        period_end: newPeriodEnd,
-      });
+    const previousEnd = previousPeriodEnd
+      ? new Date(previousPeriodEnd).toISOString()
+      : null;
 
+    if (previousEnd === newPeriodEnd) {
       creditResult = {
         processed: false,
         reason: "duplicate_renewal_period",
@@ -1030,7 +1086,7 @@ async function handleWebhook(request, env) {
 
       creditResult = {
         processed: true,
-        reason: "subsequent_monthly_renewal",
+        reason: "subscription_renewal",
         balance: newBalance,
       };
     }
@@ -1045,26 +1101,21 @@ async function handleWebhook(request, env) {
     dodo_customer_id: customerId,
     dodo_subscription_id: subscriptionId,
     subscription_status: statusMap[eventType],
+
+    // NEW FIELDS
+    plan_name: plan.plan_name,
+    billing_period: plan.billing_period,
+
     current_period_end: newPeriodEnd,
     updated_at: new Date().toISOString(),
   };
 
-  await supabaseRequest(
-    env,
-    "/rest/v1/user_subscriptions?on_conflict=user_id",
-    {
-      method: "POST",
-      headers: {
-        "Prefer":
-          "resolution=merge-duplicates,return=minimal",
-      },
-      body: JSON.stringify(subscription),
-    }
-  );
+  await saveSubscription(env, subscription);
 
-  console.log("Subscription webhook processed:", {
+  console.log("Subscription saved:", {
     user_id: user.id,
-    event_type: eventType,
+    plan_name: plan.plan_name,
+    billing_period: plan.billing_period,
     subscription_status: statusMap[eventType],
     credit_result: creditResult,
   });
@@ -1073,7 +1124,8 @@ async function handleWebhook(request, env) {
     ok: true,
     received: true,
     subscription_updated: true,
-    event_type: eventType,
+    plan_name: plan.plan_name,
+    billing_period: plan.billing_period,
     subscription_status: statusMap[eventType],
     credits: creditResult,
   });
