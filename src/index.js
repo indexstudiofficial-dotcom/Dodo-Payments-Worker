@@ -1,13 +1,37 @@
 // ============================================================
 // REPORTLI AI — DODO PAYMENTS WORKER
-// MONTHLY SUBSCRIPTION ONLY
 // ============================================================
-//
 // Routes:
 //   GET  /health
 //   POST /checkout
 //   POST /webhook
 //   GET  /return
+//
+// EXISTING DATABASE TABLES:
+//   public.users
+//   public.user_subscriptions
+//
+// CREDIT RULES:
+//   1. Trial start:
+//      Set balance to 20 only if balance is 0 or NULL.
+//      Never overwrite a positive existing balance.
+//
+//   2. First successful payment after trial:
+//      No additional credits.
+//
+//   3. Subsequent monthly renewal:
+//      Reset balance to exactly 20.
+//
+//   4. Failed/cancelled/expired/on-hold:
+//      No credits.
+//
+//   5. Duplicate renewal:
+//      Compare current_period_end with the stored period.
+//
+// IMPORTANT:
+// No SQL changes or new tables are required.
+// Renewal deduplication is best-effort because the existing
+// schema has no dedicated webhook-event ledger.
 //
 // REQUIRED SECRETS:
 //   SUPABASE_SERVICE_ROLE_KEY
@@ -16,24 +40,12 @@
 //
 // REQUIRED VARIABLES:
 //   SUPABASE_URL
-//   DODO_PRODUCT_ID_MONTHLY
+//   DODO_PAYMENTS_PRODUCT_ID
 //   DODO_PAYMENTS_ENVIRONMENT
 //   FRONTEND_SETTINGS_URL
 //
 // OPTIONAL SECRET:
 //   CHECKOUT_API_SECRET
-//
-// DODO_PAYMENTS_ENVIRONMENT:
-//   live_mode
-//   test_mode
-//
-// CREDIT RULES:
-//   Trial: Set balance to 20 only if balance is 0 or NULL.
-//   First payment: No additional credits.
-//   Subsequent monthly renewal: Reset balance to 20.
-//   Failed/cancelled/expired/on-hold: No credits.
-//   Duplicate renewal: Compare current_period_end.
-//
 // ============================================================
 
 const LIVE_API = "https://live.dodopayments.com";
@@ -70,7 +82,6 @@ export default {
         return json({
           ok: true,
           worker: "reportli-dodo-payments",
-          plan: "monthly",
         });
       }
 
@@ -150,7 +161,7 @@ function validateConfig(env) {
     "SUPABASE_SERVICE_ROLE_KEY",
     "DODO_PAYMENTS_API_KEY",
     "DODO_PAYMENTS_WEBHOOK_KEY",
-    "DODO_PRODUCT_ID_MONTHLY",
+    "DODO_PAYMENTS_PRODUCT_ID",
     "DODO_PAYMENTS_ENVIRONMENT",
     "FRONTEND_SETTINGS_URL",
   ];
@@ -270,7 +281,7 @@ async function supabaseRequest(
 }
 
 // ============================================================
-// MONTHLY CHECKOUT
+// CHECKOUT
 // ============================================================
 
 async function createCheckout(request, env) {
@@ -305,10 +316,10 @@ async function createCheckout(request, env) {
     }, 400);
   }
 
-  if (body.plan !== "monthly") {
+  if (body.plan !== "premium") {
     return json({
       ok: false,
-      error: "Unsupported plan. Expected plan: monthly.",
+      error: "Unsupported plan. Expected plan: premium.",
     }, 400);
   }
 
@@ -343,7 +354,7 @@ async function createCheckout(request, env) {
   const payload = {
     product_cart: [
       {
-        product_id: env.DODO_PRODUCT_ID_MONTHLY,
+        product_id: env.DODO_PAYMENTS_PRODUCT_ID,
         quantity: 1,
       },
     ],
@@ -357,8 +368,7 @@ async function createCheckout(request, env) {
 
     metadata: {
       user_id: appUser.id,
-      plan: "monthly",
-      billing_period: "monthly",
+      plan: "premium",
       source: "reportli_ai",
     },
 
@@ -558,6 +568,13 @@ async function verifyWebhook(
 // ============================================================
 // USER LOOKUP
 // ============================================================
+//
+// Prefer metadata.user_id.
+// If absent, fall back to the customer's email.
+//
+// Email fallback is provided for compatibility with webhook
+// payloads where subscription metadata is missing.
+// ============================================================
 
 async function findUserForWebhook(
   env,
@@ -634,8 +651,16 @@ async function getExistingSubscription(
 }
 
 // ============================================================
-// TRIAL CREDIT HELPER
+// CREDIT HELPERS
 // ============================================================
+
+// Trial rule:
+// - Only set the balance to 20 when the existing balance is
+//   zero or NULL.
+// - Preserve positive balances.
+//
+// The conditional PATCH prevents overwriting a positive
+// balance that was observed before this request.
 
 async function grantTrialCredits(
   env,
@@ -691,7 +716,7 @@ async function grantTrialCredits(
     };
   }
 
-  // Handle NULL balance separately.
+  // NULL balance requires a separate conditional update.
   const nullRows = await supabaseRequest(
     env,
     "/rest/v1/users" +
@@ -725,15 +750,15 @@ async function grantTrialCredits(
     };
   }
 
+  // Balance changed between lookup and update.
   return {
     granted: false,
     reason: "balance_changed_or_already_initialized",
   };
 }
 
-// ============================================================
-// MONTHLY RENEWAL CREDIT HELPER
-// ============================================================
+// Renewal rule:
+// Set balance to 20, NOT current balance + 20.
 
 async function resetRenewalCredits(
   env,
@@ -761,7 +786,7 @@ async function resetRenewalCredits(
     );
   }
 
-  console.log("Monthly renewal credits reset:", {
+  console.log("Renewal credits reset:", {
     user_id: userId,
     balance: Number(rows[0].balance),
   });
@@ -811,7 +836,7 @@ async function handleWebhook(request, env) {
   });
 
   // ----------------------------------------------------------
-  // MONTHLY SUBSCRIPTION EVENT ALLOWLIST
+  // Subscription event allowlist
   // ----------------------------------------------------------
 
   const subscriptionEvents = new Set([
@@ -867,7 +892,7 @@ async function handleWebhook(request, env) {
   }
 
   // ----------------------------------------------------------
-  // SUBSCRIPTION STATUS
+  // Determine subscription status
   // ----------------------------------------------------------
 
   const statusMap = {
@@ -894,7 +919,7 @@ async function handleWebhook(request, env) {
     null;
 
   // ----------------------------------------------------------
-  // EXISTING SUBSCRIPTION
+  // Read existing subscription before updating it.
   // ----------------------------------------------------------
 
   const existing = await getExistingSubscription(
@@ -905,18 +930,24 @@ async function handleWebhook(request, env) {
   const previousPeriodEnd =
     existing?.current_period_end || null;
 
-  let newPeriodEnd = null;
-
-  if (periodEnd) {
-    const parsedDate = new Date(periodEnd);
-
-    if (!Number.isNaN(parsedDate.getTime())) {
-      newPeriodEnd = parsedDate.toISOString();
-    }
-  }
+  const newPeriodEnd = periodEnd
+    ? new Date(periodEnd).toISOString()
+    : null;
 
   // ----------------------------------------------------------
   // TRIAL CREDIT RULE
+  // ----------------------------------------------------------
+  //
+  // Trial detection uses trial_period_days supplied in the
+  // subscription payload.
+  //
+  // This only initializes the balance when it is zero/NULL.
+  // Existing positive balances are preserved.
+  //
+  // IMPORTANT:
+  // If Dodo does not include trial_period_days in a particular
+  // event, this event cannot be reliably identified as trial
+  // activation by this check alone.
   // ----------------------------------------------------------
 
   let creditResult = {
@@ -943,7 +974,16 @@ async function handleWebhook(request, env) {
   }
 
   // ----------------------------------------------------------
-  // SUBSEQUENT MONTHLY RENEWAL RULE
+  // RENEWAL CREDIT RULE
+  // ----------------------------------------------------------
+  //
+  // Only subscription.renewed can grant renewal credits here.
+  //
+  // subscription_period_count must be greater than 1 to avoid
+  // treating the initial subscription period as a renewal.
+  //
+  // current_period_end is used as a best-effort duplicate
+  // marker using your existing schema.
   // ----------------------------------------------------------
 
   const periodCount = Number(
@@ -957,7 +997,7 @@ async function handleWebhook(request, env) {
   if (isSubsequentRenewal) {
     if (!newPeriodEnd) {
       console.error(
-        "Renewal event has no valid billing-period end date."
+        "Renewal event has no billing-period end date."
       );
 
       return json({
@@ -967,22 +1007,12 @@ async function handleWebhook(request, env) {
       }, 500);
     }
 
-    let previousPeriodEndNormalized = null;
-
-    if (previousPeriodEnd) {
-      const previousDate = new Date(previousPeriodEnd);
-
-      if (!Number.isNaN(previousDate.getTime())) {
-        previousPeriodEndNormalized =
-          previousDate.toISOString();
-      }
-    }
-
     if (
-      previousPeriodEndNormalized &&
-      newPeriodEnd === previousPeriodEndNormalized
+      previousPeriodEnd &&
+      newPeriodEnd ===
+        new Date(previousPeriodEnd).toISOString()
     ) {
-      console.log("Duplicate monthly renewal ignored:", {
+      console.log("Duplicate renewal period ignored:", {
         user_id: user.id,
         subscription_id: subscriptionId,
         period_end: newPeriodEnd,
@@ -1015,10 +1045,7 @@ async function handleWebhook(request, env) {
     dodo_customer_id: customerId,
     dodo_subscription_id: subscriptionId,
     subscription_status: statusMap[eventType],
-    current_period_end:
-      newPeriodEnd ||
-      existing?.current_period_end ||
-      null,
+    current_period_end: newPeriodEnd,
     updated_at: new Date().toISOString(),
   };
 
@@ -1035,7 +1062,7 @@ async function handleWebhook(request, env) {
     }
   );
 
-  console.log("Monthly subscription webhook processed:", {
+  console.log("Subscription webhook processed:", {
     user_id: user.id,
     event_type: eventType,
     subscription_status: statusMap[eventType],
@@ -1046,7 +1073,6 @@ async function handleWebhook(request, env) {
     ok: true,
     received: true,
     subscription_updated: true,
-    plan: "monthly",
     event_type: eventType,
     subscription_status: statusMap[eventType],
     credits: creditResult,
@@ -1063,4 +1089,4 @@ function handleReturn(env) {
     "https://reportliai.sbs/settings";
 
   return Response.redirect(destination, 303);
-}
+      }
