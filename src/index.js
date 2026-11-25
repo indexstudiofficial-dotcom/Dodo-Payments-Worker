@@ -7,8 +7,8 @@
 //   POST /webhook
 //   GET  /return
 //
-// EXISTING DATABASE TABLES:
-//   public.users
+// DATABASE TABLES:
+//   public.users              (id, email, full_name, balance, ...)
 //   public.user_subscriptions
 //
 // CREDIT RULES:
@@ -41,11 +41,11 @@
 // REQUIRED VARIABLES:
 //   SUPABASE_URL
 //   DODO_PAYMENTS_PRODUCT_ID
-//   DODO_PAYMENTS_ENVIRONMENT
+//   DODO_PAYMENTS_ENVIRONMENT      (live_mode | test_mode)
 //   FRONTEND_SETTINGS_URL
 //
 // OPTIONAL SECRET:
-//   CHECKOUT_API_SECRET
+//   CHECKOUT_API_SECRET            (send as X-Checkout-Secret header)
 // ============================================================
 
 const LIVE_API = "https://live.dodopayments.com";
@@ -325,11 +325,12 @@ async function createCheckout(request, env) {
 
   const userId = body.user_id.trim();
 
+  // FIX: the users table has "full_name", not "display_name".
   const userRows = await supabaseRequest(
     env,
     "/rest/v1/users" +
     `?id=eq.${encodeURIComponent(userId)}` +
-    "&select=id,email,display_name,balance&limit=1"
+    "&select=id,email,full_name,balance&limit=1"
   );
 
   if (
@@ -361,8 +362,8 @@ async function createCheckout(request, env) {
 
     customer: {
       email: appUser.email,
-      ...(appUser.display_name
-        ? { name: appUser.display_name }
+      ...(appUser.full_name
+        ? { name: appUser.full_name }
         : {}),
     },
 
@@ -571,9 +572,6 @@ async function verifyWebhook(
 //
 // Prefer metadata.user_id.
 // If absent, fall back to the customer's email.
-//
-// Email fallback is provided for compatibility with webhook
-// payloads where subscription metadata is missing.
 // ============================================================
 
 async function findUserForWebhook(
@@ -939,15 +937,8 @@ async function handleWebhook(request, env) {
   // ----------------------------------------------------------
   //
   // Trial detection uses trial_period_days supplied in the
-  // subscription payload.
-  //
-  // This only initializes the balance when it is zero/NULL.
-  // Existing positive balances are preserved.
-  //
-  // IMPORTANT:
-  // If Dodo does not include trial_period_days in a particular
-  // event, this event cannot be reliably identified as trial
-  // activation by this check alone.
+  // subscription payload. Only initializes the balance when it
+  // is zero/NULL. Positive balances are preserved.
   // ----------------------------------------------------------
 
   let creditResult = {
@@ -977,13 +968,10 @@ async function handleWebhook(request, env) {
   // RENEWAL CREDIT RULE
   // ----------------------------------------------------------
   //
-  // Only subscription.renewed can grant renewal credits here.
-  //
-  // subscription_period_count must be greater than 1 to avoid
-  // treating the initial subscription period as a renewal.
-  //
-  // current_period_end is used as a best-effort duplicate
-  // marker using your existing schema.
+  // Only subscription.renewed can grant renewal credits.
+  // subscription_period_count must be > 1 so the initial period
+  // is not treated as a renewal.
+  // current_period_end is a best-effort duplicate marker.
   // ----------------------------------------------------------
 
   const periodCount = Number(
@@ -1089,4 +1077,4 @@ function handleReturn(env) {
     "https://reportliai.sbs/settings";
 
   return Response.redirect(destination, 303);
-      }
+}
